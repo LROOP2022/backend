@@ -14,7 +14,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, field_validator
 
 from app.model_assets import load_artifacts
-from ml_backend.predictor import MODEL_VERSION, Predictor, ScoreLookup
+from ml_backend.predictor import MODEL_VERSION, Predictor, ScoreLookup, TestFeaturesLookup
 
 BATCH_SIZE = 1000  # Predictor.predict accepts 1..1000 records
 MAX_CSV_BYTES = int(os.getenv("MAX_CSV_BYTES", str(256 * 1024 * 1024)))
@@ -40,10 +40,16 @@ class RecordsRequest(BaseModel):
     records: list[dict]
 
 
+class ExplainRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    record: dict
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     artifacts = load_artifacts()
     app.state.lookup = ScoreLookup(artifacts)
+    app.state.test_features = TestFeaturesLookup(artifacts) if (artifacts / 'test_features.sqlite').is_file() else None
     # Models are loaded once per process, at startup.
     app.state.predictor = Predictor(artifacts, thread_count=int(os.getenv("MODEL_THREADS", "2")))
     app.state.feature_set = set(app.state.predictor.features)
@@ -84,7 +90,8 @@ def predict_records(request: Request, records: list[dict]):
 
 @app.get("/health")
 def health(request: Request):
-    return {"model_ready": True, "lookup_ready": True, "model_version": MODEL_VERSION}
+    return {"model_ready": True, "lookup_ready": True,
+            "test_features_ready": request.app.state.test_features is not None, "model_version": MODEL_VERSION}
 
 
 @app.get("/actuator/health/liveness")
@@ -116,9 +123,43 @@ def predict_by_id(payload: IdRequest, request: Request):
         raise HTTPException(500, "Lookup failed") from exc
 
 
+@app.post("/api/v1/predict/by-id/details")
+def predict_by_id_details(payload: IdRequest, request: Request):
+    """Stored score, source TEST features, and model sensitivity for this ID."""
+    source = request.app.state.test_features
+    if source is None:
+        raise HTTPException(503, "TEST features artifact is not installed")
+    try:
+        score = public_result(request.app.state.lookup.predict_by_index(payload.index))
+        record = source.record_by_index(payload.index, request.app.state.predictor.features)
+        explanation = request.app.state.predictor.explain(record)
+        return {"index": score['index'], "probability": score['probability'],
+                "features": {name: record[name] for name in request.app.state.predictor.features},
+                "word_count": record['word_count'], "explanation": explanation}
+    except KeyError as exc:
+        raise HTTPException(404, "Unknown index") from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("ID details failed")
+        raise HTTPException(500, "ID details failed") from exc
+
+
 @app.post("/api/v1/predict/records")
 def predict_json(payload: RecordsRequest, request: Request):
     return {"predictions": predict_records(request, payload.records)}
+
+
+@app.post("/api/v1/predict/explain")
+def explain_record(payload: ExplainRequest, request: Request):
+    """Sensitivity of one full CSV/JSON record; unavailable for lookup-only IDs."""
+    try:
+        return request.app.state.predictor.explain(payload.record)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Explanation failed")
+        raise HTTPException(500, "Explanation failed") from exc
 
 
 def parse_csv_row(row: dict, number: int, expected: set) -> dict:

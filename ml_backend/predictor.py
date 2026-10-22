@@ -4,6 +4,8 @@ import json
 import numbers
 import sqlite3
 import threading
+import struct
+import zlib
 from pathlib import Path
 
 MODEL_VERSION = 'bankruptcy-final-one-match-v1'
@@ -28,6 +30,22 @@ class ScoreLookup:
 
     def predict_ids(self,indices):
         return [self.predict_by_index(i) for i in indices]
+
+
+class TestFeaturesLookup:
+    """Optional companion artifact built from TEST.csv and text_data.tsv."""
+    def __init__(self,artifacts_dir):
+        self.path=Path(artifacts_dir)/'test_features.sqlite'
+        if not self.path.is_file():raise FileNotFoundError(self.path)
+
+    def record_by_index(self,index,features):
+        if isinstance(index,bool) or not isinstance(index,(str,int)):raise ValueError('index must be str or int')
+        with readonly(self.path) as db:
+            row=db.execute('SELECT features,word_count FROM test_features WHERE id=?',(str(index),)).fetchone()
+        if row is None:raise KeyError(f'Unknown TEST index: {index}')
+        values=struct.unpack('<'+'d'*len(features),row[0])
+        return {'index':str(index),**dict(zip(features,values)),
+                'word_count':zlib.decompress(row[1]).decode('utf-8') if row[1] else ''}
 
 
 class Predictor:
@@ -84,7 +102,35 @@ class Predictor:
     def predict_by_index(self,index):
         return self.lookup.predict_by_index(index)
 
-    def predict_arrays(self,table64,counts):
+    def explain(self, record, limit=16):
+        """Counterfactual sensitivity of the ensemble, with each field set to its training median.
+
+        These deltas are not SHAP values and do not sum to the prediction. The
+        exact TRAIN match rule is excluded because changing any field breaks it.
+        """
+        import numpy as np
+        if not 1 <= limit <= 32:raise ValueError('limit must be 1..32')
+        # Reuse the public validator and text parser before constructing probes.
+        final=self.predict([record])[0]['target']
+        original=np.asarray([[record[f] for f in self.features]],dtype=np.float64)
+        counts=self.c4['hasher'].transform([self.parse_text(record.get('word_count'))])
+        base=float(self.predict_arrays(original,counts,apply_exact_match=False)[0])
+        importance=np.asarray(self.raw.feature_importance(importance_type='gain'),dtype=float)
+        importance+=np.asarray(self.joint.feature_importance(importance_type='gain')[:len(self.features)],dtype=float)
+        candidates=np.argsort(-importance,kind='stable')[:48]
+        probes=np.repeat(original,len(candidates),axis=0)
+        for row,column in enumerate(candidates):probes[row,column]=self.prep['median'][column]
+        from scipy.sparse import vstack
+        alternatives=self.predict_arrays(probes,vstack([counts]*len(candidates)),apply_exact_match=False)
+        items=[{'feature':self.features[int(column)],'value':float(original[0,column]),
+                'reference':float(self.prep['median'][column]),'delta':float(base-alternatives[row])}
+               for row,column in enumerate(candidates)]
+        items.sort(key=lambda item:abs(item['delta']),reverse=True)
+        return {'probability':final,'base_probability':base,'method':'median_replacement',
+                'candidate_count':len(candidates),'total_features':len(self.features),
+                'contributions':items[:limit], 'exact_match_adjustment':float(final-base)}
+
+    def predict_arrays(self,table64,counts,apply_exact_match=True):
         """Internal batch API: ordered float64 table + parser-v1 hashed count CSR."""
         import numpy as np
         import pandas as pd
@@ -111,12 +157,13 @@ class Predictor:
             linear=self.linear.predict_proba(self.prep['scaler'].transform(z))[:,1]
             base=.9*(.25*(raw+joint+t1+t4))+.1*linear
             final=base.copy()
-            with readonly(self.root/'profiles.sqlite') as db:
-                for i,row in enumerate(a):
-                    blob=row.tobytes();h=hashlib.blake2b(blob,digest_size=16).digest()
-                    found=db.execute('SELECT profile,n,s FROM profiles WHERE hash=?',(h,)).fetchone()
-                    if found is not None:
-                        if found[0]!=blob:raise RuntimeError('Fingerprint collision: exact match rejected')
-                        if found[1]==1:final[i]=(found[2]+base[i])/2
+            if apply_exact_match:
+                with readonly(self.root/'profiles.sqlite') as db:
+                    for i,row in enumerate(a):
+                        blob=row.tobytes();h=hashlib.blake2b(blob,digest_size=16).digest()
+                        found=db.execute('SELECT profile,n,s FROM profiles WHERE hash=?',(h,)).fetchone()
+                        if found is not None:
+                            if found[0]!=blob:raise RuntimeError('Fingerprint collision: exact match rejected')
+                            if found[1]==1:final[i]=(found[2]+base[i])/2
         if not np.isfinite(final).all() or ((final<0)|(final>1)).any():raise RuntimeError('Invalid prediction')
         return final

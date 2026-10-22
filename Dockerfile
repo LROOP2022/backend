@@ -13,6 +13,9 @@ ARG MODEL_BUNDLE_URL=https://s3.hack.week-infra.ru/backend/ml_artifacts_v1.tar
 COPY ml_backend/manifest.json ./ml_backend/manifest.json
 COPY scripts ./scripts
 RUN python -m scripts.fetch_artifacts "$MODEL_BUNDLE_URL" /models/artifacts
+ARG TEST_FEATURES_URL=https://s3.hack.week-infra.ru/backend/test_features.sqlite
+COPY ml_backend/test_features.sha256 ./ml_backend/test_features.sha256
+RUN python -m scripts.fetch_test_features "$TEST_FEATURES_URL" /models/artifacts/test_features.sqlite
 ENV ML_ARTIFACTS_DIR=/models/artifacts
 
 COPY app ./app
